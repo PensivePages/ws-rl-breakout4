@@ -163,79 +163,135 @@ MC_targ = Meta-Controller()
 C_pred = Controller()
 C_targ = Controller()
 #critic_nn = Critic_NN() #not implemented
-critic = Critic()
+#critic = Critic() #not in use
 
 class Agent():
 
     def __init__(self, env, MC_buffer, C_buffer,\
                  learning_rate, gamma,\
                  exploration_param2, exploration_param1,
-                 batch, epochs):
+                 batch, max_goals_to_try, batch_size, extrinsic_tries_before_eval):
         self.env = env
         self.learning_rate = learning_rate
         self.MC_buffer = MC_buffer
         self.C_buffer = C_buffer
-        self.gamma2 = gamma2 # "discount rate
-        self.ep2 = exploration_param2 #MC
-        self.ep1 = exploration_param1 #C
+        self.gamma2 = gamma2 # "discount rate"
+        self.ep2 = exploration_param2 #MC, meta-controller
+        self.ep1 = exploration_param1 #C, controller
         self.batch = batch #input
         self.done = False
         self.terminated = False
-        self.epochs = epochs
-        self.epoch = 0
+        self.max_goals_to_try = max_goals_to_try
+        self.num_goals_tried = 0
         self.Q1 = None
         self.Q2 = None
+        self.batch_size = batch_size
+        self.intrinsic_reward = 0
+        self.intrinsic_success_count = 0
+        self.intrinsic_total = 0
+        self.extrinsic_success_count = 0
+        self.total_sessions = 0
+        self.eval_tries = extrinsic_tries_before_eval
+        self.done = False
 
-    def _init_model(self, env):
+    def _init_Q(self, env):
         self.Q1 = defaultdict(lambda: np.zeros(env.action_space.n))
-        self.Q2 = defaultdict(lambda: np.zeros(env.action_space.n))
         #^ this way, if the state doesn't exist create it with n zeros = number of actions
+        self.Q2 = defaultdict(lambda: np.zeros(len(goals))) #pseudo
+
+    def critic(action, goal):
+        # execute action in env
+        next_state, extrinsic_reward, done = env(action) #pseudo
+        # get intrinsic reward
+        if goal == next_state: return extrinsic_reward, 1, next_state, done #intrinsic_reward = 1
+        else: return extrinsic_reward, 0, next_state, done #intrinsic_reward = 0
+
+    def select_direction(choices, exploration_param): #select goal, or action, greedy vs explore
+        random = np.random.uniform(size=1)[0]
+        if random <= exploration_param:
+            return np.random.choice(np.arange(len(choices)))
+        else: #greedy
+            return np.argmax(choices)
 
     def train(self):
-        if self.Q == None:
-            _init_model(self, env)
-        bQ1 = 0 #count for batch to break for training
-        bQ2 = 0 #count for batch to break for training
-        while epoch < epochs or not done or not terminated:
+        if self.Q1 == None:
+            _init_Q(self, env)
+        bQn = 0 #count for batch to break for training
+        while self.num_goals_tried < self.max_goals_to_try:
             Q2_prediction = MC_pred(self.batch) # set Q values for goal at given state
-            #Q2_expectation = MC_targ(self.next_batch) # set Q values for goal at given state
-            i_goal = np.argmax(Q2_prediction[state]) # e-greedy only atm
-            goal = goals[i_goal] # select goal image from list of goals by index
-            #NOTE: "exploration probability e2" with starting value 1 works with the greedy pick
-            # ^so, if random(0 to 1) < e1: choose random action
-            # ^likewise, if random(0 to 1) < e2: choose random goal
-            self.batch = torch.cat((self.batch, goal), dim=1)
-            intrinsic_reward = 0
-            while intrinsic_reward == 0:
+            i_goal = select_direction(Q2_prediction[state], self.ep2) # select goal intex
+            goal = goals[i_goal] #pseudo # select goal image from list of goals by index
+            self.batch = torch.cat((self.batch, goal), dim=1) #put goal with input images
+            while intrinsic_reward == 0 and not self.done:
                 Q1_prediction = C_pred(self.batch) # set Q values for action at given state and goal
-                #Q1_expectation = C_targ(self.next_batch) # set Q values for action at given state and goal
-                i_action = np.argmax(Q1_prediction[state]) # e-greedy only atm
-                action = actions[i_action] # select action from list of actions by index
-                extrinsic_reward, intrinsic_reward, next_state, done = critic(action)
-                # store controller transition
-                C_buffer.push(False, state, action, goal, intrinsic_reward, next_state)
-                MC_buffer.push(True, state, goal, extrinsic_reward, next_state)
-                #Q1_expectation = intrinsic_reward + (gamma^t-t_prime) * max(Q1_expectation)
-                #loss = mse(Q1_prediction, Q1_expectation.detatch())
-                bQ1 += 1
-            # store meta-controller transision
-            #MC_buffer.push(True, state, goal, extrinsic_reward, next_state)
-            #Q2_expectation = extrinsic_reward + (gamma^t-t_prime) * max(Q2_expectation)
-            #loss = mse(Q2_prediction, Q2_expectation.detatch())
-            epoch += 1
-            bQ2 += 1
+                i_action = select_direction(Q1_prediction[state], self.ep1) # select action intex
+                action = actions[i_action] #pseudo # select action from list of actions by index
+                extrinsic_reward, intrinsic_reward, next_state, self.done = critic(action, goal) #get rewards and state
+                self.batch = torch.cat((get_images_for_state(next_state), goal), dim=1) #pseudo #next controller input
+                # store transitions
+                C_buffer.push(False, state, action, goal, intrinsic_reward, next_state) #store controller transition
+                MC_buffer.push(True, state, goal, extrinsic_reward, next_state) #store meta-controller transition
+                # manage batch NN update cycle
+                bQn += 1
+                if bQn%batch_size == 0: #update every batch_size
+                    states, next_states, rewards, goals = get_random_batch(C_buffer) #pseudo/not implemented
+                    self.update_Q1(states, next_states, rewards, goals)
+                    states, next_states, rewards, _ = get_random_batch(MC_buffer) #pseudo/not implemented
+                    self.update_Q2(states, next_states, rewards)
+                # track intrinsic reward success and total
+                if intrinsic_reward > 0:
+                    self.intrinsic_success_count += 1
+                self.intrinsic_total += 1
+                # track extrinsic reward success
+                if extrinsic_reward > 0:
+                    self.extrinsic_success_count += 1
+            # track number of goal tried so far
+            self.num_goals_tried += 1
+            # when done reset session
+            if self.done:
+                # track total sessions
+                self.total_sessions += 1
+                # reset goal to init
+                #pass
+                # reset state to init
+                #pass
+                # reset self.batch to init
+                #pass
+                # reset time_step to init
+                #time_step = 0 #pseudo, time_step not defined atm
+            #--update the exploration params--
+            if self.num_goals_tried%self.eval_tries == 0:
+                # how often intrinsic goal reached
+                self.ep1 = 1 - (self.intrinsic_success_count/self.intrinsic_total)
+                # how often intrinsic goals lead to extrinsic goal
+                #pass
+                # how often extrinsic goal was reached
+                self.ep2 = 1 - (self.extrinsic_success_count/self.total_sessions)
+                if self.ep2 < .1:
+                    self.ep2 = .1 #cap minimum exploration at .1
 
-    def update_Q1(self):
-        Q1_prediction = C_pred(self.batch)
-        Q1_expectation = C_targ(self.next_batch)
-        Q1_expectation = intrinsic_reward + (gamma^t-t_prime) * max(Q1_expectation)
-        Q1_loss = mse(Q1_prediction, Q1_expectation.detatch())
+    def update_Q1(self, states, next_states, rewards, goals):
+        prediction = C_pred(states, goals)
+        expectation = C_targ(next_states, goals) #should I consider if the next_state changed the goal? how?
+        #^ changing goal may be a arguments to use pred = random_batch[:-1] and tar =random_batch[1:]
+        #   ^then use just the 'states' and that goal
+        #       ^because the shifted state would = next_state and next_goal
+        expectation = rewards + (gamma^t-t_prime) * max(expectation) #pseudo
+        loss = F.mse_loss(prediction, expectation.detatch())
 
-    def update_Q2(self):
-        Q2_prediction = MC_pred(self.batch)
-        Q2_expectation = MC_targ(self.next_batch)
-        Q2_expectation = extrinsic_reward + (gamma^t-t_prime) * max(Q2_expectation)
-        Q2_loss = mse(Q2_prediction, Q2_expectation.detatch())
+    def update_Q2(self, states, next_states, rewards):
+        prediction = MC_pred(states)
+        expectation = MC_targ(next_states)
+        expectation = rewards + (gamma^t-t_prime) * max(expectation) #pseudo
+        loss = F.mse_loss(prediction, expectation.detatch())
+
+    def get_random_batch(self, transitions):
+        random_batch = transitions[np.random.choice(np.arange(len(transitions)), self.batch_size)] #pseudo, but close?
+        states = random_batch[:, 'state'] #pseudo
+        next_states = random_batch[:, 'next_state'] #pseudo
+        rewards = random_batch[:, 'reward'] #pseudo
+        goals = random_batch[:, 'goal'] #pseudo
+        return states, next_states, rewards, goals
             
             
 
@@ -247,6 +303,9 @@ exploration_param2 = 1 #start at 1 go to 0.1
 exploration_param1 = 1 #start at 1 go to 0.1
 num_of_goals = object_detector.goals #pseudo
 num_of_actions = env.actions #pseudo
+max_goals_to_try = 10000
+batch_size = 512
+extrinsic_tries_before_eval = batch_size
 
 #general dims
 nc = 3
@@ -262,7 +321,7 @@ C_conv_out = C_batch_size * C_C * C_W * C_H
 C_hidden_size = 512
 C_num_of_actions = num_of_actions
 
-# critic dims
+# critic dims #not implemented
 input_size_critic = conv_out_size
 hidden_size_critic = conv_out_size
 output_size_critic = 1 #num_of_rewards?
@@ -270,10 +329,10 @@ output_size_critic = 1 #num_of_rewards?
 #---memory---
 # meta-controller
 D2 = namestuple('D2',
-                    ('state', 'goal', 'extrinsic_reward', 'next_state'))
+                    ('state', 'goal', 'reward', 'next_state')) #reward = extrinsic reward
 # controller
 D1 = namestuple('D1',
-                    ('state', 'action', 'goal', 'intrinsic_reward', 'next_state'))
+                    ('state', 'action', 'goal', 'reward', 'next_state')) #reward = intrinsic reward
 
 MC_buffer = ReplayMemory(1000000)
 C_buffer = ReplayMemory(50000)
