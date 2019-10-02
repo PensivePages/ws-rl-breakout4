@@ -169,16 +169,17 @@ class Agent():
 
     def __init__(self, env, MC_buffer, C_buffer,\
                  learning_rate, gamma,\
-                 exploration_param2, exploration_param1,
-                 batch, max_goals_to_try, batch_size, extrinsic_tries_before_eval):
+                 exploration_param2, exploration_param1,\
+                 max_goals_to_try, batch_size, extrinsic_tries_before_eval):
+        self.new_session = True
         self.env = env
         self.learning_rate = learning_rate
         self.MC_buffer = MC_buffer
         self.C_buffer = C_buffer
-        self.gamma2 = gamma2 # "discount rate"
+        self.gamma = gamma # "discount rate"
         self.ep2 = exploration_param2 #MC, meta-controller
         self.ep1 = exploration_param1 #C, controller
-        self.batch = batch #input
+        self.state = None #input
         self.done = False
         self.terminated = False
         self.max_goals_to_try = max_goals_to_try
@@ -199,9 +200,16 @@ class Agent():
         #^ this way, if the state doesn't exist create it with n zeros = number of actions
         self.Q2 = defaultdict(lambda: np.zeros(len(goals))) #pseudo
 
+    def init_session(self):
+        # reset state to init
+        self.state = env.rest() #pseudo, need to know th command
+        # reset time_step to init
+        time_step = 0
+        return self.state, time_step
+
     def critic(action, goal):
         # execute action in env
-        next_state, extrinsic_reward, done = env(action) #pseudo
+        next_state, extrinsic_reward, done = self.env(action) #pseudo
         # get intrinsic reward
         if goal == next_state: return extrinsic_reward, 1, next_state, done #intrinsic_reward = 1
         else: return extrinsic_reward, 0, next_state, done #intrinsic_reward = 0
@@ -218,19 +226,26 @@ class Agent():
             _init_Q(self, env)
         bQn = 0 #count for batch to break for training
         while self.num_goals_tried < self.max_goals_to_try:
-            Q2_prediction = MC_pred(self.batch) # set Q values for goal at given state
-            i_goal = select_direction(Q2_prediction[state], self.ep2) # select goal intex
+            if self.new_session == True:
+                # reset session
+                state, time_step = init_session()
+                self.new_session = False
+            Q2_prediction = MC_pred(state) # set Q values for goal at given state
+            i_goal = select_direction(Q2_prediction, self.ep2) # select goal intex
             goal = goals[i_goal] #pseudo # select goal image from list of goals by index
-            self.batch = torch.cat((self.batch, goal), dim=1) #put goal with input images
-            while intrinsic_reward == 0 and not self.done:
-                Q1_prediction = C_pred(self.batch) # set Q values for action at given state and goal
-                i_action = select_direction(Q1_prediction[state], self.ep1) # select action intex
-                action = actions[i_action] #pseudo # select action from list of actions by index
-                extrinsic_reward, intrinsic_reward, next_state, self.done = critic(action, goal) #get rewards and state
-                self.batch = torch.cat((get_images_for_state(next_state), goal), dim=1) #pseudo #next controller input
+            state_goal = torch.cat((state, goal), dim=1) #pseudo #put goal with input images
+            while self.intrinsic_reward == 0 and not self.done:
+                Q1_prediction = C_pred(state_goal) # set Q values for action at given state and goal
+                i_action = select_direction(Q1_prediction, self.ep1) # select action intex
+                action = self.env.action_space[i_action] #pseudo # select action from list of actions by index
+                extrinsic_reward, self.intrinsic_reward, next_state, self.done = critic(action, goal) #get rewards and state
+                state_goal = torch.cat((state, goal), dim=1) #pseudo #next controller input
                 # store transitions
-                C_buffer.push(False, state, action, goal, intrinsic_reward, next_state) #store controller transition
+                C_buffer.push(False, state, action, goal, self.intrinsic_reward, next_state) #store controller transition
                 MC_buffer.push(True, state, goal, extrinsic_reward, next_state) #store meta-controller transition
+                # update state
+                state = next_state
+                state_goal = torch.cat((state, goal), dim=1) #pseudo #next controller input
                 # manage batch NN update cycle
                 bQn += 1
                 if bQn%batch_size == 0: #update every batch_size
@@ -245,24 +260,20 @@ class Agent():
                 # track extrinsic reward success
                 if extrinsic_reward > 0:
                     self.extrinsic_success_count += 1
-            # track number of goal tried so far
+            # track number of goals tried so far
             self.num_goals_tried += 1
             # when done reset session
             if self.done:
                 # track total sessions
                 self.total_sessions += 1
-                # reset goal to init
-                #pass
-                # reset state to init
-                #pass
-                # reset self.batch to init
-                #pass
-                # reset time_step to init
-                #time_step = 0 #pseudo, time_step not defined atm
+                # new session
+                new_session = True
             #--update the exploration params--
             if self.num_goals_tried%self.eval_tries == 0:
                 # how often intrinsic goal reached
                 self.ep1 = 1 - (self.intrinsic_success_count/self.intrinsic_total)
+                if self.ep1 < .1:
+                    self.ep1 = .1 #cap minimum exploration at .1
                 # how often intrinsic goals lead to extrinsic goal
                 #pass
                 # how often extrinsic goal was reached
@@ -273,7 +284,7 @@ class Agent():
     def update_Q1(self, states, next_states, rewards, goals):
         prediction = C_pred(states, goals)
         expectation = C_targ(next_states, goals) #should I consider if the next_state changed the goal? how?
-        #^ changing goal may be a arguments to use pred = random_batch[:-1] and tar =random_batch[1:]
+        #^ changing goal may be a argument to use: pred = random_batch[:-1] and tar = random_batch[1:]
         #   ^then use just the 'states' and that goal
         #       ^because the shifted state would = next_state and next_goal
         expectation = rewards + (gamma^t-t_prime) * max(expectation) #pseudo
@@ -286,23 +297,37 @@ class Agent():
         loss = F.mse_loss(prediction, expectation.detatch())
 
     def get_random_batch(self, transitions):
-        random_batch = transitions[np.random.choice(np.arange(len(transitions)), self.batch_size)] #pseudo, but close?
+        random_batch = np.array(transitions)[np.random.choice(np.arange(len(transitions)), self.batch_size)] #pseudo, but close?
         states = random_batch[:, 'state'] #pseudo
         next_states = random_batch[:, 'next_state'] #pseudo
         rewards = random_batch[:, 'reward'] #pseudo
         goals = random_batch[:, 'goal'] #pseudo
         return states, next_states, rewards, goals
+
+    def update_df(self):
+        pass
             
             
 
+#---memory---
+# meta-controller
+D2 = namestuple('D2',
+                    ('state', 'goal', 'reward', 'next_state')) #reward = extrinsic reward
+# controller
+D1 = namestuple('D1',
+                    ('state', 'action', 'goal', 'reward', 'next_state')) #reward = intrinsic reward
+
 #---params---
+env = MontezumasRevengeEnv() #pseudo
+MC_buffer = ReplayMemory(1000000)
+C_buffer = ReplayMemory(50000)
 learning_rate =  0.00025
 gamma = .99
 exploration_param2 = 1 #start at 1 go to 0.1
 
 exploration_param1 = 1 #start at 1 go to 0.1
-num_of_goals = object_detector.goals #pseudo
-num_of_actions = env.actions #pseudo
+num_of_goals = object_detector.goals.n #pseudo
+num_of_actions = env.action_space.n #pseudo
 max_goals_to_try = 10000
 batch_size = 512
 extrinsic_tries_before_eval = batch_size
@@ -325,14 +350,3 @@ C_num_of_actions = num_of_actions
 input_size_critic = conv_out_size
 hidden_size_critic = conv_out_size
 output_size_critic = 1 #num_of_rewards?
-
-#---memory---
-# meta-controller
-D2 = namestuple('D2',
-                    ('state', 'goal', 'reward', 'next_state')) #reward = extrinsic reward
-# controller
-D1 = namestuple('D1',
-                    ('state', 'action', 'goal', 'reward', 'next_state')) #reward = intrinsic reward
-
-MC_buffer = ReplayMemory(1000000)
-C_buffer = ReplayMemory(50000)
