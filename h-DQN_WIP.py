@@ -4,6 +4,7 @@ import torch.nn.parallel
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+import cv2
 import gym
 #colab install for universe
 #!git clone https://github.com/openai/universe.git
@@ -44,10 +45,11 @@ def conv(in_channels, out_channels, kernel_size, stride=2, padding=1, batch_norm
 
 class Meta_Controller(nn.Module):
     # Meta-controller chooses a goal
-    def __init__(self):
+    def __init__(self, MC_conv_out, MC_hidden_size, MC_number_of_goals, ngpu):
         super(Meta_Controller, self).__init__()
+        self.ngpu = ngpu
         # conv(channels_in, channels_out, kernel, stride, padding)
-        self.conv1 = conv(3, 32, 8, 4, 0) #all 3 convs set to paper figure 5b Q1 example
+        self.conv1 = conv(1, 32, 8, 4, 0) #all 3 convs set to paper figure 5b Q1 example
         self.conv2 = conv(32, 64, 4, 2, 0)
         self.conv3 = conv(64, 64, 3, 1, 0)
         self.projection = nn.Linear(MC_conv_out, MC_hidden_size) #set to h=512 via paper figure 5b
@@ -55,12 +57,12 @@ class Meta_Controller(nn.Module):
         self.nonLinearity = torch.nn.ReLU()
         self.softmax = nn.Softmax() #not sure if used
 
-    def forward(self):
+    def forward(self, x):
         print("inside Meta_Controller.forward")
         x = self.nonLinearity(self.conv1(x))
         x = self.nonLinearity(self.conv2(x))
         x = self.nonLinearity(self.conv3(x))
-        print("Meta_Controller final conv out: ", x)
+        print("Meta_Controller final conv out: ", x.size())
         x = x.view(1, -1) # flatten
         x = self.nonLinearity(self.projection(x))
         x = self.output(x)
@@ -68,10 +70,11 @@ class Meta_Controller(nn.Module):
         return x
 
 class Controller(nn.Module):
-    def __init__(self):
+    def __init__(self, C_conv_out, C_hidden_size, C_number_of_actions, ngpu):
         super(Controller, self).__init__()
+        self.ngpu = ngpu
         # conv(channels_in, channels_out, kernel, stride, padding)
-        self.conv1 = conv(3, 32, 8, 4, 0) #all 3 convs set to paper figure 5b
+        self.conv1 = conv(1, 32, 8, 4, 0) #all 3 convs set to paper figure 5b
         self.conv2 = conv(32, 64, 4, 2, 0)
         self.conv3 = conv(64, 64, 3, 1, 0)
         self.projection = nn.Linear(C_conv_out, C_hidden_size) #set to h=512 via paper figure 5b
@@ -79,12 +82,12 @@ class Controller(nn.Module):
         self.nonLinearity = torch.nn.ReLU()
         self.softmax = nn.Softmax() #not sure if used
 
-    def forward(self):
+    def forward(self, x):
         print("inside Controller.forward")
         x = self.nonLinearity(self.conv1(x))
         x = self.nonLinearity(self.conv2(x))
         x = self.nonLinearity(self.conv3(x))
-        print("Controller final conv out: ", x)
+        print("Controller final conv out: ", x.size())
         x = x.view(1, -1) # flatten
         x = self.nonLinearity(self.projection(x))
         x = self.output(x)
@@ -102,7 +105,7 @@ class Critic_NN(nn.Module):
         self.nonLinearity = torch.nn.ReLU()
         self.softmax = nn.Softmax() #not sure if used
 
-    def forward(self):
+    def forward(self, x):
         x = self.nonLinearity(self.conv1(x))
         x = self.nonLinearity(self.conv2(x))
         x = self.nonLinearity(self.conv3(x))
@@ -227,7 +230,20 @@ class Agent():
         time_step = 0
         return self.state, time_step
 
-    def critic(action, goal):
+    def preprocess(self, observation):
+        observation = cv2.cvtColor(cv2.resize(observation, (84, 110)), cv2.COLOR_BGR2GRAY)
+        observation = observation[26:110,:]
+        ret, observation = cv2.threshold(observation,1,255,cv2.THRESH_BINARY)
+        return np.reshape(observation,(1,84,84)) #np.reshape(observation,(84,84,1)) #original
+
+    def format_state(self, state):
+        state = self.preprocess(state)
+        print("state shape: ", state.shape)
+        state = torch.from_numpy(state).unsqueeze(dim=0).type('torch.FloatTensor')
+        print("state size: ", state.size())
+        return state.to(device)
+
+    def critic(self, action, goal):
         print("inside critic")
         # execute action in env
         next_state, extrinsic_reward, done = self.env(action) #pseudo
@@ -235,7 +251,7 @@ class Agent():
         if goal == next_state: return extrinsic_reward, 1, next_state, done #intrinsic_reward = 1
         else: return extrinsic_reward, 0, next_state, done #intrinsic_reward = 0
 
-    def select_direction(choices, exploration_param): #select goal, or action, greedy vs explore
+    def select_direction(self, choices, exploration_param): #select goal, or action, greedy vs explore
         print("inside select_direction")
         random = np.random.uniform(size=1)[0]
         if random <= exploration_param:
@@ -252,10 +268,7 @@ class Agent():
             if self.new_session == True:
                 # reset session
                 state, time_step = self.init_session()
-                print("state[0]: ", state[0])
-                print("state shape: ", state.shape)
-                #np.transpose(state, (0, 3, 2, 1))
-                #print("state shape: ", state.shape)
+                state = self.format_state(state)
                 self.new_session = False
             Q2_prediction = MC_pred(state) # set Q values for goal at given state
             i_goal = self.select_direction(Q2_prediction, self.ep2) # select goal intex
@@ -266,6 +279,7 @@ class Agent():
                 i_action = self.select_direction(Q1_prediction, self.ep1) # select action intex
                 action = self.env.action_space[i_action] #pseudo # select action from list of actions by index
                 extrinsic_reward, self.intrinsic_reward, next_state, self.done = self.critic(action, goal) #get rewards and state
+                next_state = self.format_state(next_state)
                 # store transitions
                 C_buffer.push(False, state, action, goal, self.intrinsic_reward, next_state) #store controller transition
                 MC_buffer.push(True, state, goal, extrinsic_reward, next_state) #store meta-controller transition
@@ -358,17 +372,14 @@ D1 = namedtuple('D1',
                     ('state', 'action', 'goal', 'reward', 'next_state')) #reward = intrinsic reward
 
 #---params---
-#general dims
-nc = 3
-ngf = 64
 
 # meta-controller dims
-MC_conv_out = 4 * 64 * 5 * 5 #guess for now
+MC_conv_out = 1 * 64 * 7 * 7 #guess for now
 MC_hidden_size = 512
 MC_number_of_goals = 6 #num_of_goals
 
 # controller dims
-C_conv_out = 5 * 64 * 5 * 5 #guess for now
+C_conv_out = 1 * 64 * 7 * 7 #guess for now
 C_hidden_size = 512
 C_number_of_actions = env.action_space.n #num_of_actions
 
@@ -378,7 +389,7 @@ C_number_of_actions = env.action_space.n #num_of_actions
 # output_size_critic = 1 #num_of_rewards?
 
 # Agent vars
-env = env #pseudo
+env = env
 MC_buffer = ReplayMemory(1000000)
 C_buffer = ReplayMemory(50000)
 learning_rate =  0.00025
@@ -391,17 +402,26 @@ max_goals_to_try = 10000
 batch_size = 512
 extrinsic_tries_before_eval = batch_size #setting for batch_size ftm
 
+# Number of GPUs available. Use 0 for CPU mode.
+ngpu = 1
+
+# Decide which device we want to run on
+device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
+
 # Assign models
-MC_pred = Meta_Controller()
-#MC_pred.apply(weights_init)
-MC_targ = Meta_Controller()
-#MC_targ.apply(weights_init)
-C_pred = Controller()
-#C_pred.apply(weights_init)
-C_targ = Controller()
-#C_targ.apply(weights_init)
-#critic_nn = Critic_NN() #not implemented
-#critic = Critic() #not in use
+MC_pred = Meta_Controller(MC_conv_out, MC_hidden_size, MC_number_of_goals, ngpu).to(device)
+MC_pred.apply(weights_init)
+MC_targ = Meta_Controller(MC_conv_out, MC_hidden_size, MC_number_of_goals, ngpu).to(device)
+MC_targ.apply(weights_init)
+C_pred = Controller(C_conv_out, C_hidden_size, C_number_of_actions, ngpu).to(device)
+C_pred.apply(weights_init)
+C_targ = Controller(C_conv_out, C_hidden_size, C_number_of_actions, ngpu).to(device)
+C_targ.apply(weights_init)
+
+# Handle multi-gpu if desired
+model = None #not Implemented
+if (device.type == 'cuda') and (ngpu > 1):
+    model = nn.DataParallel(model, list(range(ngpu)))
 
 # Setup Adam optimizers for MC_pred and C_pred, excluded _targ in attempt to hold those constant
 optimizerMC = optim.Adam(MC_pred.parameters(), lr=learning_rate, betas=(0.5, 0.999))
