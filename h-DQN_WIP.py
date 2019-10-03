@@ -2,9 +2,32 @@ import torch
 import torch.nn as nn
 import torch.nn.parallel
 import torch.nn.functional as F
+import torch.optim as optim
 import numpy as np
-from collections import defaultdict #for Q ie: state store
-from collections import namestuple #for transistions store ie: memory, buffer, ReplayMemory
+import gym
+#colab install for universe
+#!git clone https://github.com/openai/universe.git
+#!cd universe
+#!pip install -e .
+#!pip install 'gym[atari]'
+#!pip install universe
+import universe # register the universe environments
+import atari_py as ap #for list
+from collections import defaultdict #for Q ie: state Q values store
+from collections import namedtuple #for transistions store ie: memory, buffer, ReplayMemory
+
+# list of the games
+game_list = ap.list_games()
+print(sorted(game_list))
+
+# custom weights initialization
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
 
 def conv(in_channels, out_channels, kernel_size, stride=2, padding=1, batch_norm=True, init_zero_weights=False):
     """Creates a convolutional layer, with optional batch normalization.
@@ -19,7 +42,7 @@ def conv(in_channels, out_channels, kernel_size, stride=2, padding=1, batch_norm
         layers.append(nn.BatchNorm2d(out_channels))
     return nn.Sequential(*layers)
 
-class Meta_Controller():
+class Meta_Controller(nn.Module):
     # Meta-controller chooses a goal
     def __init__(self):
         super(Meta_Controller, self).__init__()
@@ -27,16 +50,17 @@ class Meta_Controller():
         self.conv1 = conv(3, 32, 8, 4, 0) #all 3 convs set to paper figure 5b Q1 example
         self.conv2 = conv(32, 64, 4, 2, 0)
         self.conv3 = conv(64, 64, 3, 1, 0)
-        self.MC_conv_out = self.conv3.size(0) * self.conv3.size(1) * self.conv3.size(2) * self.conv3.size(3)
         self.projection = nn.Linear(MC_conv_out, MC_hidden_size) #set to h=512 via paper figure 5b
         self.output = nn.Linear(MC_hidden_size, MC_number_of_goals)
         self.nonLinearity = torch.nn.ReLU()
         self.softmax = nn.Softmax() #not sure if used
 
     def forward(self):
+        print("inside Meta_Controller.forward")
         x = self.nonLinearity(self.conv1(x))
         x = self.nonLinearity(self.conv2(x))
         x = self.nonLinearity(self.conv3(x))
+        print("Meta_Controller final conv out: ", x)
         x = x.view(1, -1) # flatten
         x = self.nonLinearity(self.projection(x))
         x = self.output(x)
@@ -50,16 +74,17 @@ class Controller(nn.Module):
         self.conv1 = conv(3, 32, 8, 4, 0) #all 3 convs set to paper figure 5b
         self.conv2 = conv(32, 64, 4, 2, 0)
         self.conv3 = conv(64, 64, 3, 1, 0)
-        self.C_conv_out = self.conv3.size(0) * self.conv3.size(1) * self.conv3.size(2) * self.conv3.size(3)
         self.projection = nn.Linear(C_conv_out, C_hidden_size) #set to h=512 via paper figure 5b
         self.output = nn.Linear(C_hidden_size, C_number_of_actions)
         self.nonLinearity = torch.nn.ReLU()
         self.softmax = nn.Softmax() #not sure if used
 
     def forward(self):
+        print("inside Controller.forward")
         x = self.nonLinearity(self.conv1(x))
         x = self.nonLinearity(self.conv2(x))
         x = self.nonLinearity(self.conv3(x))
+        print("Controller final conv out: ", x)
         x = x.view(1, -1) # flatten
         x = self.nonLinearity(self.projection(x))
         x = self.output(x)
@@ -158,13 +183,6 @@ class ReplayMemory(object):
         '''
         return len(self.memory)
 
-MC_pred = Meta-Controller()
-MC_targ = Meta-Controller()
-C_pred = Controller()
-C_targ = Controller()
-#critic_nn = Critic_NN() #not implemented
-#critic = Critic() #not in use
-
 class Agent():
 
     def __init__(self, env, MC_buffer, C_buffer,\
@@ -195,19 +213,22 @@ class Agent():
         self.eval_tries = extrinsic_tries_before_eval
         self.done = False
 
-    def _init_Q(self, env):
+    def init_Q(self, env):
+        print("inside init_Q")
         self.Q1 = defaultdict(lambda: np.zeros(env.action_space.n))
         #^ this way, if the state doesn't exist create it with n zeros = number of actions
         self.Q2 = defaultdict(lambda: np.zeros(len(goals))) #pseudo
 
     def init_session(self):
+        print("inside init_session")
         # reset state to init
-        self.state = env.rest() #pseudo, need to know th command
+        self.state = env.reset() #pseudo, need to know th command
         # reset time_step to init
         time_step = 0
         return self.state, time_step
 
     def critic(action, goal):
+        print("inside critic")
         # execute action in env
         next_state, extrinsic_reward, done = self.env(action) #pseudo
         # get intrinsic reward
@@ -215,6 +236,7 @@ class Agent():
         else: return extrinsic_reward, 0, next_state, done #intrinsic_reward = 0
 
     def select_direction(choices, exploration_param): #select goal, or action, greedy vs explore
+        print("inside select_direction")
         random = np.random.uniform(size=1)[0]
         if random <= exploration_param:
             return np.random.choice(np.arange(len(choices)))
@@ -222,24 +244,28 @@ class Agent():
             return np.argmax(choices)
 
     def train(self):
+        print("inside train")
         if self.Q1 == None:
-            _init_Q(self, env)
+            self.init_Q(env)
         bQn = 0 #count for batch to break for training
         while self.num_goals_tried < self.max_goals_to_try:
             if self.new_session == True:
                 # reset session
-                state, time_step = init_session()
+                state, time_step = self.init_session()
+                print("state[0]: ", state[0])
+                print("state shape: ", state.shape)
+                #np.transpose(state, (0, 3, 2, 1))
+                #print("state shape: ", state.shape)
                 self.new_session = False
             Q2_prediction = MC_pred(state) # set Q values for goal at given state
-            i_goal = select_direction(Q2_prediction, self.ep2) # select goal intex
+            i_goal = self.select_direction(Q2_prediction, self.ep2) # select goal intex
             goal = goals[i_goal] #pseudo # select goal image from list of goals by index
             state_goal = torch.cat((state, goal), dim=1) #pseudo #put goal with input images
             while self.intrinsic_reward == 0 and not self.done:
                 Q1_prediction = C_pred(state_goal) # set Q values for action at given state and goal
-                i_action = select_direction(Q1_prediction, self.ep1) # select action intex
+                i_action = self.select_direction(Q1_prediction, self.ep1) # select action intex
                 action = self.env.action_space[i_action] #pseudo # select action from list of actions by index
-                extrinsic_reward, self.intrinsic_reward, next_state, self.done = critic(action, goal) #get rewards and state
-                state_goal = torch.cat((state, goal), dim=1) #pseudo #next controller input
+                extrinsic_reward, self.intrinsic_reward, next_state, self.done = self.critic(action, goal) #get rewards and state
                 # store transitions
                 C_buffer.push(False, state, action, goal, self.intrinsic_reward, next_state) #store controller transition
                 MC_buffer.push(True, state, goal, extrinsic_reward, next_state) #store meta-controller transition
@@ -249,12 +275,12 @@ class Agent():
                 # manage batch NN update cycle
                 bQn += 1
                 if bQn%batch_size == 0: #update every batch_size
-                    states, next_states, rewards, goals = get_random_batch(C_buffer) #pseudo/not implemented
+                    states, next_states, rewards, goals = self.get_random_batch(C_buffer) #pseudo/not implemented
                     self.update_Q1(states, next_states, rewards, goals)
-                    states, next_states, rewards, _ = get_random_batch(MC_buffer) #pseudo/not implemented
+                    states, next_states, rewards, _ = self.get_random_batch(MC_buffer) #pseudo/not implemented
                     self.update_Q2(states, next_states, rewards)
                 # track intrinsic reward success and total
-                if intrinsic_reward > 0:
+                if self.intrinsic_reward > 0:
                     self.intrinsic_success_count += 1
                 self.intrinsic_total += 1
                 # track extrinsic reward success
@@ -267,7 +293,7 @@ class Agent():
                 # track total sessions
                 self.total_sessions += 1
                 # new session
-                new_session = True
+                self.new_session = True
             #--update the exploration params--
             if self.num_goals_tried%self.eval_tries == 0:
                 # how often intrinsic goal reached
@@ -282,21 +308,32 @@ class Agent():
                     self.ep2 = .1 #cap minimum exploration at .1
 
     def update_Q1(self, states, next_states, rewards, goals):
-        prediction = C_pred(states, goals)
-        expectation = C_targ(next_states, goals) #should I consider if the next_state changed the goal? how?
+        print("inside update_Q1")
+        C_pred.zero_grad()
+        states_goals = torch.cat((states, goals), dim=1) #pseudo #next controller input
+        prediction = C_pred(states_goals)
+        states_goals = torch.cat((next_states, goals), dim=1) #pseudo #next controller input
+        expectation = C_targ(states_goals) #should I consider if the next_state changed the goal? how?
         #^ changing goal may be a argument to use: pred = random_batch[:-1] and tar = random_batch[1:]
         #   ^then use just the 'states' and that goal
         #       ^because the shifted state would = next_state and next_goal
         expectation = rewards + (gamma^t-t_prime) * max(expectation) #pseudo
-        loss = F.mse_loss(prediction, expectation.detatch())
+        loss = F.nn.MSELoss(prediction, expectation.detatch())
+        loss.backward()
+        optimizerC.step()
 
     def update_Q2(self, states, next_states, rewards):
+        print("inside update_Q2")
+        MC_pred.zero_grad()
         prediction = MC_pred(states)
         expectation = MC_targ(next_states)
         expectation = rewards + (gamma^t-t_prime) * max(expectation) #pseudo
-        loss = F.mse_loss(prediction, expectation.detatch())
+        loss = F.nn.MSELoss(prediction, expectation.detatch())
+        loss.backward()
+        optimizerMC.step()
 
     def get_random_batch(self, transitions):
+        print("inside get_random_batch")
         random_batch = np.array(transitions)[np.random.choice(np.arange(len(transitions)), self.batch_size)] #pseudo, but close?
         states = random_batch[:, 'state'] #pseudo
         next_states = random_batch[:, 'next_state'] #pseudo
@@ -307,46 +344,77 @@ class Agent():
     def update_df(self):
         pass
             
-            
+#--environment--
+env = gym.make('MontezumaRevenge-v4')
+env.reset()
+#env.render()
 
 #---memory---
 # meta-controller
-D2 = namestuple('D2',
+D2 = namedtuple('D2',
                     ('state', 'goal', 'reward', 'next_state')) #reward = extrinsic reward
 # controller
-D1 = namestuple('D1',
+D1 = namedtuple('D1',
                     ('state', 'action', 'goal', 'reward', 'next_state')) #reward = intrinsic reward
 
 #---params---
-env = MontezumasRevengeEnv() #pseudo
-MC_buffer = ReplayMemory(1000000)
-C_buffer = ReplayMemory(50000)
-learning_rate =  0.00025
-gamma = .99
-exploration_param2 = 1 #start at 1 go to 0.1
-
-exploration_param1 = 1 #start at 1 go to 0.1
-num_of_goals = object_detector.goals.n #pseudo
-num_of_actions = env.action_space.n #pseudo
-max_goals_to_try = 10000
-batch_size = 512
-extrinsic_tries_before_eval = batch_size
-
 #general dims
 nc = 3
 ngf = 64
 
 # meta-controller dims
-MC_conv_out = MC_batch_size * MC_C * MC_W * MC_H
+MC_conv_out = 4 * 64 * 5 * 5 #guess for now
 MC_hidden_size = 512
-MC_number_of_goals = num_of_goals
+MC_number_of_goals = 6 #num_of_goals
 
 # controller dims
-C_conv_out = C_batch_size * C_C * C_W * C_H
+C_conv_out = 5 * 64 * 5 * 5 #guess for now
 C_hidden_size = 512
-C_num_of_actions = num_of_actions
+C_number_of_actions = env.action_space.n #num_of_actions
 
-# critic dims #not implemented
-input_size_critic = conv_out_size
-hidden_size_critic = conv_out_size
-output_size_critic = 1 #num_of_rewards?
+# # critic dims #not implemented
+# input_size_critic = conv_out_size
+# hidden_size_critic = conv_out_size
+# output_size_critic = 1 #num_of_rewards?
+
+# Agent vars
+env = env #pseudo
+MC_buffer = ReplayMemory(1000000)
+C_buffer = ReplayMemory(50000)
+learning_rate =  0.00025
+gamma = .99
+exploration_param2 = 1 #start at 1 go to 0.1
+exploration_param1 = 1 #start at 1 go to 0.1
+num_of_goals = 6 #randomly picked 6 ftm #object_detector.goals.n #pseudo
+num_of_actions = env.action_space.n
+max_goals_to_try = 10000
+batch_size = 512
+extrinsic_tries_before_eval = batch_size #setting for batch_size ftm
+
+# Assign models
+MC_pred = Meta_Controller()
+#MC_pred.apply(weights_init)
+MC_targ = Meta_Controller()
+#MC_targ.apply(weights_init)
+C_pred = Controller()
+#C_pred.apply(weights_init)
+C_targ = Controller()
+#C_targ.apply(weights_init)
+#critic_nn = Critic_NN() #not implemented
+#critic = Critic() #not in use
+
+# Setup Adam optimizers for MC_pred and C_pred, excluded _targ in attempt to hold those constant
+optimizerMC = optim.Adam(MC_pred.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+optimizerC = optim.Adam(C_pred.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+
+#--Agent call--
+Agent(env, #environment
+      MC_buffer, #MC_buffer
+      C_buffer, #C_buffer
+      learning_rate, #learning_rate
+      gamma, #gamma
+      exploration_param1, #exploration_param1
+      exploration_param2, #exploration_param2
+      max_goals_to_try, #max_goals_to_try
+      batch_size, #batch_size
+      extrinsic_tries_before_eval) #extrinsic_tries_before_eval
