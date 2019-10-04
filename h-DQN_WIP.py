@@ -230,17 +230,32 @@ class Agent():
         time_step = 0
         return self.state, time_step
 
+    # preprocess() from: http://www.pinchofintelligence.com/openai-gym-part-3-playing-space-invaders-deep-reinforcement-learning/
     def preprocess(self, observation):
         observation = cv2.cvtColor(cv2.resize(observation, (84, 110)), cv2.COLOR_BGR2GRAY)
         observation = observation[26:110,:]
         ret, observation = cv2.threshold(observation,1,255,cv2.THRESH_BINARY)
         return np.reshape(observation,(1,84,84)) #np.reshape(observation,(84,84,1)) #original
 
-    def format_state(self, state):
+    def format_state(self, state, first = None):
         state = self.preprocess(state)
         print("state shape: ", state.shape)
         state = torch.from_numpy(state).unsqueeze(dim=0).type('torch.FloatTensor')
         print("state size: ", state.size())
+        if first:
+            #some test code from preprocess() source
+            action0 = 0  # do nothing
+            observation0, reward0, terminal, info = env.step(action0)
+            print("Before processing: " + str(np.array(observation0).shape))
+            plt.imshow(np.array(observation0))
+            plt.show()
+            observation0 = self.preprocess(observation0)
+            print("After processing: " + str(np.array(observation0).shape))
+            plt.imshow(np.array(np.squeeze(observation0)))
+            plt.show()
+            #brain.setInitState(observation0) #test model not used
+            #brain.currentState = np.squeeze(brain.currentState) #test model not used
+        
         return state.to(device)
 
     def critic(self, action, goal):
@@ -261,6 +276,7 @@ class Agent():
 
     def train(self):
         print("inside train")
+        first = True
         if self.Q1 == None:
             self.init_Q(env)
         bQn = 0 #count for batch to break for training
@@ -268,8 +284,9 @@ class Agent():
             if self.new_session == True:
                 # reset session
                 state, time_step = self.init_session()
-                state = self.format_state(state)
+                state = self.format_state(state, first)
                 self.new_session = False
+                first = False
             Q2_prediction = MC_pred(state) # set Q values for goal at given state
             i_goal = self.select_direction(Q2_prediction, self.ep2) # select goal intex
             goal = goals[i_goal] #pseudo # select goal image from list of goals by index
@@ -331,7 +348,7 @@ class Agent():
         #^ changing goal may be a argument to use: pred = random_batch[:-1] and tar = random_batch[1:]
         #   ^then use just the 'states' and that goal
         #       ^because the shifted state would = next_state and next_goal
-        expectation = rewards + (gamma^t-t_prime) * max(expectation) #pseudo
+        expectation = rewards + (gamma * np.amax(expectation)) #pseudo #notice, as long as (gamma^t_prime-t) is relative to the previous state it's gamma^1 = gamma
         loss = F.nn.MSELoss(prediction, expectation.detatch())
         loss.backward()
         optimizerC.step()
@@ -341,7 +358,7 @@ class Agent():
         MC_pred.zero_grad()
         prediction = MC_pred(states)
         expectation = MC_targ(next_states)
-        expectation = rewards + (gamma^t-t_prime) * max(expectation) #pseudo
+        expectation = rewards + (gamma * np.amax(expectation)) #pseudo #notice, as long as (gamma^t_prime-t) is relative to the previous state it's gamma^1 = gamma
         loss = F.nn.MSELoss(prediction, expectation.detatch())
         loss.backward()
         optimizerMC.step()
