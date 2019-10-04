@@ -44,7 +44,7 @@ def conv(in_channels, out_channels, kernel_size, stride=2, padding=1, batch_norm
     return nn.Sequential(*layers)
 
 class Meta_Controller(nn.Module):
-    # Meta-controller chooses a goal
+    # Meta-controller predicts the value of a goal
     def __init__(self, MC_conv_out, MC_hidden_size, MC_number_of_goals, ngpu):
         super(Meta_Controller, self).__init__()
         self.ngpu = ngpu
@@ -55,7 +55,6 @@ class Meta_Controller(nn.Module):
         self.projection = nn.Linear(MC_conv_out, MC_hidden_size) #set to h=512 via paper figure 5b
         self.output = nn.Linear(MC_hidden_size, MC_number_of_goals)
         self.nonLinearity = torch.nn.ReLU()
-        self.softmax = nn.Softmax() #not sure if used
 
     def forward(self, x):
         print("inside Meta_Controller.forward")
@@ -63,13 +62,13 @@ class Meta_Controller(nn.Module):
         x = self.nonLinearity(self.conv2(x))
         x = self.nonLinearity(self.conv3(x))
         print("Meta_Controller final conv out: ", x.size())
-        x = x.view(1, -1) # flatten
+        x = x.view(4, -1) # flatten
         x = self.nonLinearity(self.projection(x))
         x = self.output(x)
-        #x = self.softmax(self.output(x)) #not sure if used
         return x
 
 class Controller(nn.Module):
+    # Controller predicts the value of a action
     def __init__(self, C_conv_out, C_hidden_size, C_number_of_actions, ngpu):
         super(Controller, self).__init__()
         self.ngpu = ngpu
@@ -80,7 +79,6 @@ class Controller(nn.Module):
         self.projection = nn.Linear(C_conv_out, C_hidden_size) #set to h=512 via paper figure 5b
         self.output = nn.Linear(C_hidden_size, C_number_of_actions)
         self.nonLinearity = torch.nn.ReLU()
-        self.softmax = nn.Softmax() #not sure if used
 
     def forward(self, x):
         print("inside Controller.forward")
@@ -88,10 +86,9 @@ class Controller(nn.Module):
         x = self.nonLinearity(self.conv2(x))
         x = self.nonLinearity(self.conv3(x))
         print("Controller final conv out: ", x.size())
-        x = x.view(1, -1) # flatten
+        x = x.view(4, -1) # flatten
         x = self.nonLinearity(self.projection(x))
         x = self.output(x)
-        x = self.softmax(self.output(x)) #not sure if used
         return x
 
 class Critic_NN(nn.Module):
@@ -200,7 +197,7 @@ class Agent():
         self.gamma = gamma # "discount rate"
         self.ep2 = exploration_param2 #MC, meta-controller
         self.ep1 = exploration_param1 #C, controller
-        self.state = None #input
+        #self.state = None #input
         self.done = False
         self.terminated = False
         self.max_goals_to_try = max_goals_to_try
@@ -215,6 +212,42 @@ class Agent():
         self.total_sessions = 0
         self.eval_tries = extrinsic_tries_before_eval
         self.done = False
+        self.goals = []
+        self.actions = list(range(self.env.action_space.n))
+
+    def change_pixels(self, state, center_pixels: list, padding: int): #state tensor size (N, C, W, H)
+        staring_row = center_pixels[0] - padding
+        starting_column = center_pixels[1] - padding
+        side = padding * 2 + 1
+        i, j = staring_row, starting_column
+        while i < side:
+            while j < side:
+                state[0][0][i][j] = 127
+                j += 1
+            i += 1
+        return state
+    
+    def create_goals(self, state):
+        #goal_template = torch.ones_like(state)
+        # goal 1 (key): change pixels: center: row: 30, column: 9, padding: 1?
+        #key = change_pixels(self, goal_template, [30, 9], 2)
+        key = lambda state: self.change_pixels(state, [30, 9], 2)
+        # goal 2 (middle-ladder): change pixels: center: row: 35, column: 41, padding: _?
+        #middle_ladder = change_pixels(self, goal_template, [35, 41], 2)
+        middle_ladder = lambda state: self.change_pixels(state, [35, 41], 2)
+        # goal 3 (left-ladder): change pixels: center: row: 59, column: 17, padding: _?
+        #left_ladder = change_pixels(self, goal_template, [59, 17], 2)
+        left_ladder = lambda state: self.change_pixels(state, [59, 17], 2)
+        # goal 4 (right-ladder): change pixels: center: row: 59, column: 71, padding: _?
+        #right_ladder = change_pixels(self, goal_template, [59, 71], 2)
+        right_ladder = lambda state: self.change_pixels(state, [59, 71], 2)
+        # goal 5 (left-door): change pixels: center: row: 10, column: 10, padding: _?
+        #left_door = change_pixels(self, goal_template, [10, 10], 2)
+        left_door = lambda state: self.change_pixels(state, [10, 10], 2)
+        # goal 6 (right-door): change pixels: center: row: 10, column: 76, padding: _?
+        #right_door = change_pixels(self, goal_template, [10, 76], 2)
+        right_door = lambda state: self.change_pixels(state, [10, 76], 2)
+        self.goals = [key, middle_ladder, left_ladder, right_ladder, left_door, right_door]
 
     def init_Q(self, env):
         print("inside init_Q")
@@ -225,10 +258,13 @@ class Agent():
     def init_session(self):
         print("inside init_session")
         # reset state to init
-        self.state = env.reset() #pseudo, need to know th command
+        state = env.reset() #pseudo, need to know the command
         # reset time_step to init
-        time_step = 0
-        return self.state, time_step
+        time_step = 0 #not in use atm
+        # create goals
+        if not self.goals:
+            self.create_goals(state)
+        return state, time_step
 
     # preprocess() from: http://www.pinchofintelligence.com/openai-gym-part-3-playing-space-invaders-deep-reinforcement-learning/
     def preprocess(self, observation):
@@ -237,15 +273,21 @@ class Agent():
         ret, observation = cv2.threshold(observation,1,255,cv2.THRESH_BINARY)
         return np.reshape(observation,(1,84,84)) #np.reshape(observation,(84,84,1)) #original
 
-    def format_state(self, state, first = None):
+    def format_state(self, state, next_state=None, test=False): #so format_state() shows what the preprocessing changes once
         state = self.preprocess(state)
-        print("state shape: ", state.shape)
         state = torch.from_numpy(state).unsqueeze(dim=0).type('torch.FloatTensor')
-        print("state size: ", state.size())
-        if first:
+        # init starting image state with 3 previous void images states
+        if self.new_session:
+            ph_state = torch.zeros_like(state)
+            state = torch.cat((state, ph_state), dim=0)
+            state = torch.cat((state, ph_state), dim=0)
+            state = torch.cat((state, ph_state), dim=0)
             #some test code from preprocess() source
             action0 = 0  # do nothing
             observation0, reward0, terminal, info = env.step(action0)
+            print("reward0: ", reward0)
+            print("terminal: ", terminal)
+            print("info: ", info)
             print("Before processing: " + str(np.array(observation0).shape))
             plt.imshow(np.array(observation0))
             plt.show()
@@ -255,13 +297,35 @@ class Agent():
             plt.show()
             #brain.setInitState(observation0) #test model not used
             #brain.currentState = np.squeeze(brain.currentState) #test model not used
+        else:
+            state = self.update_state(self, state, next_state)
+        if test:
+            print("state size (shape): ", state.size())
+            #print("state: ", state)
+            batch = state
+            bottom_label = list(range(0, 83))
+            for image in batch:
+                for channel in image: #only 1 channel since gray scale
+                    for i, grid in enumerate(channel):
+                        print("Grid %s: "%(i), grid)
+                        print("label  :        ", bottom_label)
+                    break #break after 1
         
         return state.to(device)
+    
+    def update_state(self, state, next_state):
+        state[1:] = state[:-1]
+        state[0] = next_state
+        return state
+
+    def place_goal_in_state(state, goal):
+        state[0] *= goal
+        return state
 
     def critic(self, action, goal):
         print("inside critic")
         # execute action in env
-        next_state, extrinsic_reward, done = self.env(action) #pseudo
+        next_state, extrinsic_reward, done, info = self.env.step(action) #pseudo
         # get intrinsic reward
         if goal == next_state: return extrinsic_reward, 1, next_state, done #intrinsic_reward = 1
         else: return extrinsic_reward, 0, next_state, done #intrinsic_reward = 0
@@ -276,7 +340,6 @@ class Agent():
 
     def train(self):
         print("inside train")
-        first = True
         if self.Q1 == None:
             self.init_Q(env)
         bQn = 0 #count for batch to break for training
@@ -284,31 +347,31 @@ class Agent():
             if self.new_session == True:
                 # reset session
                 state, time_step = self.init_session()
-                state = self.format_state(state, first)
+                state = self.format_state(state)
                 self.new_session = False
                 first = False
             Q2_prediction = MC_pred(state) # set Q values for goal at given state
             i_goal = self.select_direction(Q2_prediction, self.ep2) # select goal intex
-            goal = goals[i_goal] #pseudo # select goal image from list of goals by index
-            state_goal = torch.cat((state, goal), dim=1) #pseudo #put goal with input images
+            goal = self.goals[i_goal] # select goal function
+            state_goal = goal(state) # put goal on current state image
             while self.intrinsic_reward == 0 and not self.done:
                 Q1_prediction = C_pred(state_goal) # set Q values for action at given state and goal
                 i_action = self.select_direction(Q1_prediction, self.ep1) # select action intex
-                action = self.env.action_space[i_action] #pseudo # select action from list of actions by index
+                action = self.actions[i_action] # select action from list of actions by index
                 extrinsic_reward, self.intrinsic_reward, next_state, self.done = self.critic(action, goal) #get rewards and state
-                next_state = self.format_state(next_state)
+                next_state = self.format_state(state, next_state)
+                next_state = goal(state) # put goal on current state image
                 # store transitions
-                C_buffer.push(False, state, action, goal, self.intrinsic_reward, next_state) #store controller transition
+                C_buffer.push(False, state_goal, action, self.intrinsic_reward, next_state) #store controller transition
                 MC_buffer.push(True, state, goal, extrinsic_reward, next_state) #store meta-controller transition
                 # update state
                 state = next_state
-                state_goal = torch.cat((state, goal), dim=1) #pseudo #next controller input
                 # manage batch NN update cycle
                 bQn += 1
                 if bQn%batch_size == 0: #update every batch_size
-                    states, next_states, rewards, goals = self.get_random_batch(C_buffer) #pseudo/not implemented
-                    self.update_Q1(states, next_states, rewards, goals)
-                    states, next_states, rewards, _ = self.get_random_batch(MC_buffer) #pseudo/not implemented
+                    states, next_states, rewards = self.get_random_batch(C_buffer) #pseudo
+                    self.update_Q1(states, next_states, rewards)
+                    states, next_states, rewards = self.get_random_batch(MC_buffer) #pseudo
                     self.update_Q2(states, next_states, rewards)
                 # track intrinsic reward success and total
                 if self.intrinsic_reward > 0:
@@ -338,13 +401,11 @@ class Agent():
                 if self.ep2 < .1:
                     self.ep2 = .1 #cap minimum exploration at .1
 
-    def update_Q1(self, states, next_states, rewards, goals):
+    def update_Q1(self, states, next_states, rewards):
         print("inside update_Q1")
         C_pred.zero_grad()
-        states_goals = torch.cat((states, goals), dim=1) #pseudo #next controller input
-        prediction = C_pred(states_goals)
-        states_goals = torch.cat((next_states, goals), dim=1) #pseudo #next controller input
-        expectation = C_targ(states_goals) #should I consider if the next_state changed the goal? how?
+        prediction = C_pred(states)
+        expectation = C_targ(next_states) #should I consider if the next_state changed the goal? how?
         #^ changing goal may be a argument to use: pred = random_batch[:-1] and tar = random_batch[1:]
         #   ^then use just the 'states' and that goal
         #       ^because the shifted state would = next_state and next_goal
@@ -369,11 +430,10 @@ class Agent():
         states = random_batch[:, 'state'] #pseudo
         next_states = random_batch[:, 'next_state'] #pseudo
         rewards = random_batch[:, 'reward'] #pseudo
-        goals = random_batch[:, 'goal'] #pseudo
         return states, next_states, rewards, goals
 
     def update_df(self):
-        pass
+        pass #may implement if I decide to do gamma^t'- t, where t' = current and t = (future or past) 
             
 #--environment--
 env = gym.make('MontezumaRevenge-v4')
@@ -445,7 +505,7 @@ optimizerMC = optim.Adam(MC_pred.parameters(), lr=learning_rate, betas=(0.5, 0.9
 optimizerC = optim.Adam(C_pred.parameters(), lr=learning_rate, betas=(0.5, 0.999))
 
 #--Agent call--
-Agent(env, #environment
+agent = Agent(env, #environment
       MC_buffer, #MC_buffer
       C_buffer, #C_buffer
       learning_rate, #learning_rate
@@ -455,3 +515,5 @@ Agent(env, #environment
       max_goals_to_try, #max_goals_to_try
       batch_size, #batch_size
       extrinsic_tries_before_eval) #extrinsic_tries_before_eval
+
+agent.train()
