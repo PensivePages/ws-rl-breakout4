@@ -57,15 +57,14 @@ class Meta_Controller(nn.Module):
         self.nonLinearity = torch.nn.ReLU()
 
     def forward(self, x):
-        print("inside Meta_Controller.forward")
+        #print("inside Meta_Controller.forward")
         x = self.nonLinearity(self.conv1(x))
         x = self.nonLinearity(self.conv2(x))
         x = self.nonLinearity(self.conv3(x))
-        print("Meta_Controller final conv out: ", x.size())
-        x = x.view(4, -1) # flatten
+        x = x.view(1, -1) # flatten
         x = self.nonLinearity(self.projection(x))
         x = self.output(x)
-        return x
+        return x[0]
 
 class Controller(nn.Module):
     # Controller predicts the value of a action
@@ -81,15 +80,14 @@ class Controller(nn.Module):
         self.nonLinearity = torch.nn.ReLU()
 
     def forward(self, x):
-        print("inside Controller.forward")
+        #print("inside Controller.forward")
         x = self.nonLinearity(self.conv1(x))
         x = self.nonLinearity(self.conv2(x))
         x = self.nonLinearity(self.conv3(x))
-        print("Controller final conv out: ", x.size())
-        x = x.view(4, -1) # flatten
+        x = x.view(1, -1) # flatten
         x = self.nonLinearity(self.projection(x))
         x = self.output(x)
-        return x
+        return x[0]
 
 class Critic_NN(nn.Module):
     def __init__(self, batch_size):
@@ -188,7 +186,7 @@ class Agent():
     def __init__(self, env, MC_buffer, C_buffer,\
                  learning_rate, gamma,\
                  exploration_param2, exploration_param1,\
-                 max_goals_to_try, batch_size, extrinsic_tries_before_eval):
+                 max_goals_to_try, batch_size, extrinsic_tries_before_eval, conv_stack='stacked'): #conv_stack = stacked' for 4, 1, 84, 84, or 'side_by_side' for 1, 1, 84, 336
         self.new_session = True
         self.env = env
         self.learning_rate = learning_rate
@@ -207,58 +205,77 @@ class Agent():
         self.batch_size = batch_size
         self.intrinsic_reward = 0
         self.intrinsic_success_count = 0
-        self.intrinsic_total = 0
+        self.intrinsic_total = .0001
         self.extrinsic_success_count = 0
-        self.total_sessions = 0
+        self.total_sessions = .00001
         self.eval_tries = extrinsic_tries_before_eval
         self.done = False
         self.goals = []
         self.actions = list(range(self.env.action_space.n))
+        self.num_actions = 0
+        self.session_success = False
+        self.session_success_list = []
+        self.lives = 0
+        self.max_steps = 5000
+        self.max_score = 400
+        self.score = 0
+        # reset memory
+        C_buffer.__init__(1000000)
+        MC_buffer.__init__(50000)
 
-    def change_pixels(self, state, center_pixels: list, padding: int): #state tensor size (N, C, W, H)
-        staring_row = center_pixels[0] - padding
-        starting_column = center_pixels[1] - padding
+    def change_pixels(self, state, center_pixel: list, padding: int): #state tensor size (N, C, W, H)
+        # print("state.size() goal set: ", state.size())
+        # for i, row in enumerate(state[0][0]):
+        #   print("row %s: "%(i), row)
+        staring_row = center_pixel[0] - padding
+        starting_column = center_pixel[1] - padding
         side = padding * 2 + 1
-        i, j = staring_row, starting_column
-        while i < side:
-            while j < side:
-                state[0][0][i][j] = 127
+        i = staring_row
+        while i < staring_row + side:
+            j = starting_column
+            while j < starting_column + side:
+                if i == center_pixel[0] and j == center_pixel[1]:
+                    pass
+                else:
+                    state[0][0][i][j] = 16
                 j += 1
             i += 1
-        return state
+        #print("state goal set: ", state[0][0])
+        # print("state.size() goal set: ", state.size())
+        # for i, row in enumerate(state[0][0]):
+        #   print("row %s: "%(i), row)
+        # raise NotImplementedError
+        return state, center_pixel
     
     def create_goals(self, state):
         #goal_template = torch.ones_like(state)
         # goal 1 (key): change pixels: center: row: 30, column: 9, padding: 1?
-        #key = change_pixels(self, goal_template, [30, 9], 2)
-        key = lambda state: self.change_pixels(state, [30, 9], 2)
+        key = lambda state: self.change_pixels(state, [30, 7], 3)
         # goal 2 (middle-ladder): change pixels: center: row: 35, column: 41, padding: _?
-        #middle_ladder = change_pixels(self, goal_template, [35, 41], 2)
-        middle_ladder = lambda state: self.change_pixels(state, [35, 41], 2)
+        middle_ladder = lambda state: self.change_pixels(state, [25, 41], 3)
         # goal 3 (left-ladder): change pixels: center: row: 59, column: 17, padding: _?
-        #left_ladder = change_pixels(self, goal_template, [59, 17], 2)
-        left_ladder = lambda state: self.change_pixels(state, [59, 17], 2)
+        left_ladder = lambda state: self.change_pixels(state, [55, 13], 3)
         # goal 4 (right-ladder): change pixels: center: row: 59, column: 71, padding: _?
-        #right_ladder = change_pixels(self, goal_template, [59, 71], 2)
-        right_ladder = lambda state: self.change_pixels(state, [59, 71], 2)
+        right_ladder = lambda state: self.change_pixels(state, [59, 71], 3)
         # goal 5 (left-door): change pixels: center: row: 10, column: 10, padding: _?
-        #left_door = change_pixels(self, goal_template, [10, 10], 2)
-        left_door = lambda state: self.change_pixels(state, [10, 10], 2)
+        left_door = lambda state: self.change_pixels(state, [12, 14], 3)
         # goal 6 (right-door): change pixels: center: row: 10, column: 76, padding: _?
-        #right_door = change_pixels(self, goal_template, [10, 76], 2)
-        right_door = lambda state: self.change_pixels(state, [10, 76], 2)
+        right_door = lambda state: self.change_pixels(state, [12, 69], 3)
         self.goals = [key, middle_ladder, left_ladder, right_ladder, left_door, right_door]
+        self.goals_names = ['key', 'middle_ladder', 'left_ladder', 'right_ladder', 'left_door', 'right_door']
 
     def init_Q(self, env):
-        print("inside init_Q")
+        #print("inside init_Q")
         self.Q1 = defaultdict(lambda: np.zeros(env.action_space.n))
         #^ this way, if the state doesn't exist create it with n zeros = number of actions
         self.Q2 = defaultdict(lambda: np.zeros(len(goals))) #pseudo
 
     def init_session(self):
-        print("inside init_session")
+        #print("inside init_session")
         # reset state to init
-        state = env.reset() #pseudo, need to know the command
+        self.env = utils.wrap_env(gym.make('MontezumaRevenge-v4'))
+        state = self.env.reset()
+        self.done = False
         # reset time_step to init
         time_step = 0 #not in use atm
         # create goals
@@ -270,35 +287,51 @@ class Agent():
     def preprocess(self, observation):
         observation = cv2.cvtColor(cv2.resize(observation, (84, 110)), cv2.COLOR_BGR2GRAY)
         observation = observation[26:110,:]
-        ret, observation = cv2.threshold(observation,1,255,cv2.THRESH_BINARY)
+        #ret, observation = cv2.threshold(observation,1,255,cv2.THRESH_BINARY)
+        ret, observation = cv2.threshold(observation,20,255,cv2.THRESH_TRUNC)
+        #ret, observation = cv2.threshold(observation,0,255,cv2.THRESH_TOZERO)
         return np.reshape(observation,(1,84,84)) #np.reshape(observation,(84,84,1)) #original
 
-    def format_state(self, state, next_state=None, test=False): #so format_state() shows what the preprocessing changes once
-        state = self.preprocess(state)
-        state = torch.from_numpy(state).unsqueeze(dim=0).type('torch.FloatTensor')
+    def format_state(self, state, next_state=None, test=False, first=False): #so format_state() shows what the preprocessing changes once
+        #print(state)
         # init starting image state with 3 previous void images states
         if self.new_session:
+            state = self.preprocess(state)
+            state = torch.from_numpy(state).unsqueeze(dim=0).type('torch.FloatTensor')
             ph_state = torch.zeros_like(state)
-            state = torch.cat((state, ph_state), dim=0)
-            state = torch.cat((state, ph_state), dim=0)
-            state = torch.cat((state, ph_state), dim=0)
+            #--for 4, 1, 84, 84--
+            if conv_stack=='stacked':
+                state = torch.cat((state, ph_state), dim=0)
+                state = torch.cat((state, ph_state), dim=0)
+                state = torch.cat((state, ph_state), dim=0)
+            #--for 1, 1, 84, 336--
+            else:
+                state = torch.cat((state, ph_state), dim=-1)
+                state = torch.cat((state, ph_state), dim=-1)
+                state = torch.cat((state, ph_state), dim=-1)
             #some test code from preprocess() source
-            action0 = 0  # do nothing
-            observation0, reward0, terminal, info = env.step(action0)
-            print("reward0: ", reward0)
-            print("terminal: ", terminal)
-            print("info: ", info)
-            print("Before processing: " + str(np.array(observation0).shape))
-            plt.imshow(np.array(observation0))
-            plt.show()
-            observation0 = self.preprocess(observation0)
-            print("After processing: " + str(np.array(observation0).shape))
-            plt.imshow(np.array(np.squeeze(observation0)))
-            plt.show()
-            #brain.setInitState(observation0) #test model not used
-            #brain.currentState = np.squeeze(brain.currentState) #test model not used
-        else:
-            state = self.update_state(self, state, next_state)
+            if first:
+                action0 = 0  # do nothing
+                observation0, reward0, terminal, info = env.step(action0)
+                print("action space: ", env.action_space)
+                print("observation space: ", env.observation_space)
+                print("reward0: ", reward0)
+                print("terminal: ", terminal)
+                print("info: ", info)
+                print("Before processing: " + str(np.array(observation0).shape))
+                plt.imshow(np.array(observation0))
+                plt.show()
+                observation0 = self.preprocess(observation0)
+                print("After processing: " + str(np.array(observation0).shape))
+                plt.imshow(np.array(np.squeeze(observation0)))
+                plt.show()
+                print("new observation space: ", env.observation_space)
+                #brain.setInitState(observation0) #test model not used
+                #brain.currentState = np.squeeze(brain.currentState) #test model not used
+        else: #advance state
+            next_state = self.preprocess(next_state)
+            next_state = torch.from_numpy(next_state).unsqueeze(dim=0).type('torch.FloatTensor')
+            state = self.update_state(state, next_state)
         if test:
             print("state size (shape): ", state.size())
             #print("state: ", state)
@@ -310,36 +343,77 @@ class Agent():
                         print("Grid %s: "%(i), grid)
                         print("label  :        ", bottom_label)
                     break #break after 1
+            raise NotImplementedError
         
         return state.to(device)
     
     def update_state(self, state, next_state):
-        state[1:] = state[:-1]
-        state[0] = next_state
+        #print("state: ", state)
+        #print("next_state: ", next_state)
+        #--for 4, 1, 84, 84--
+        if conv_stack=='stacked':
+            state[1:] = state[:-1]
+            state[0] = next_state
+        #--for 1, 1, 84, 336--
+        else:
+            state[:, :, :, 84:] = state[:, :, :, :252]
+            state[:, :, :, :84] = next_state
         return state
 
-    def place_goal_in_state(state, goal):
-        state[0] *= goal
-        return state
-
-    def critic(self, action, goal):
-        print("inside critic")
+    def critic(self, state, action, goal, goal_name):
+        #print("inside critic")
         # execute action in env
+        self.env.render(mode='ansi')
         next_state, extrinsic_reward, done, info = self.env.step(action) #pseudo
+        self.max_steps += 1
+        #print("info: ", info)
+        # format next_state
+        next_state = self.format_state(state, next_state)
+        next_state, goal_pixel = goal(state) # put goal on current state image
+        #check color and goal
+        # if conv_stack=='stacked':
+        #     observationCheck = next_state[0].view(84,84).numpy() # 4, 1, 84, 84
+        # else:
+        #     observationcheck = next_state[:, :, :, :84].view(84,84).numpy() # 1, 1, 84, 336
+        # print("check goal (%s) color: "%(goal_name) + str(np.array(observationCheck).shape))
+        # plt.imshow(np.array(np.squeeze(observationCheck)))
+        # plt.show()
         # get intrinsic reward
-        if goal == next_state: return extrinsic_reward, 1, next_state, done #intrinsic_reward = 1
-        else: return extrinsic_reward, 0, next_state, done #intrinsic_reward = 0
+        #print("actual goal pixel (from next_state inside critic): ", next_state[0][0][goal_pixel[0]][goal_pixel[1]])
+        #if next_state[0][0][goal_pixel[0]][goal_pixel[1]] == 255:
+        if next_state[0][0][goal_pixel[0]][goal_pixel[1]] == 20:
+            #print("actual goal pixel (from next_state inside critic): ", next_state[0][0][goal_pixel[0]][goal_pixel[1]])
+            #print("Got the (ง°ل͜°)ง %s!"%(goal_name))
+            #--show goal images
+            # if conv_stack=='stacked':
+            #     observationNext = next_state[0].view(84,84).numpy() # 4, 1, 84, 84
+            # else:
+            #     observationNext = next_state[:, :, :, :84].view(84,84).numpy() # 1, 1, 84, 336
+            # #print("w/ goal: " + str(np.array(observationNext).shape))
+            # plt.imshow(np.array(np.squeeze(observationNext)))
+            # plt.show()
+            self.session_success_list.append(goal_name)
+            if goal_name == 'key':
+                print("!!!!!!!!!!!!!!!!!!!!Got the [̲̅$̲̅(̲̅ ͡° ͜ʖ ͡°̲̅)̲̅$̲̅]  %s  [̲̅$̲̅(̲̅ ͡° ͜ʖ ͡°̲̅)̲̅$̲̅] !!!!!!!!!!!!!!!!!!!!"%(goal_name))
+            return extrinsic_reward, 1, next_state, done #intrinsic_reward = 1
+        else:
+            if info['ale.lives'] < self.lives:
+                self.lives -= 1
+                return extrinsic_reward, -10, next_state, done #intrinsic_reward = 0
+            else:
+                return extrinsic_reward, 0, next_state, done #intrinsic_reward = 0
 
     def select_direction(self, choices, exploration_param): #select goal, or action, greedy vs explore
-        print("inside select_direction")
+        #print("inside select_direction")
         random = np.random.uniform(size=1)[0]
         if random <= exploration_param:
             return np.random.choice(np.arange(len(choices)))
         else: #greedy
-            return np.argmax(choices)
+            return np.argmax(choices.detach().numpy())
 
     def train(self):
-        print("inside train")
+        #print("inside train")
+        first = True
         if self.Q1 == None:
             self.init_Q(env)
         bQn = 0 #count for batch to break for training
@@ -347,35 +421,61 @@ class Agent():
             if self.new_session == True:
                 # reset session
                 state, time_step = self.init_session()
-                state = self.format_state(state)
+                state = self.format_state(state, first=first, test=False)
                 self.new_session = False
                 first = False
+                self.session_success = False
+                self.session_success_list = []
+                self.lives = 6
+                self.max_steps = 5000
+                self.score = 0
             Q2_prediction = MC_pred(state) # set Q values for goal at given state
+            #print("Q2_prediction: ", Q2_prediction)
             i_goal = self.select_direction(Q2_prediction, self.ep2) # select goal intex
+            goal_name = self.goals_names[i_goal]
+            #print("goal is (☞ﾟヮﾟ)☞  %s  ☜(ﾟヮﾟ☜)"%(goal_name))
             goal = self.goals[i_goal] # select goal function
-            state_goal = goal(state) # put goal on current state image
-            while self.intrinsic_reward == 0 and not self.done:
+            state_goal, goal_pixel = goal(state) # put goal on current state image
+            # show goal
+            # if conv_stack=='stacked':
+            #     observationShow = state_goal[0].view(84,84).numpy() # 4, 1, 84, 84
+            # else:
+            #     observationShow = state_goal[:, :, :, :84].view(84,84).numpy() # 1, 1, 84, 336
+            # #print("Show new goal (%s): "%(goal_name) + str(np.array(observationShow).shape))
+            # plt.imshow(np.array(np.squeeze(observationShow)))
+            # plt.show()
+            self.intrinsic_reward = 0
+            while self.intrinsic_reward == 0 and not self.done or self.max_steps < 5000:
                 Q1_prediction = C_pred(state_goal) # set Q values for action at given state and goal
+                #print("Q1_prediction: ", Q1_prediction)
                 i_action = self.select_direction(Q1_prediction, self.ep1) # select action intex
                 action = self.actions[i_action] # select action from list of actions by index
-                extrinsic_reward, self.intrinsic_reward, next_state, self.done = self.critic(action, goal) #get rewards and state
-                next_state = self.format_state(state, next_state)
-                next_state = goal(state) # put goal on current state image
+                self.num_actions += 1
+                #print("action is %s"%(i_action))
+                extrinsic_reward, self.intrinsic_reward, next_state, self.done = self.critic(state, action, goal, goal_name) #get rewards and state
+                self.score += (extrinsic_reward + self.intrinsic_reward)
                 # store transitions
                 C_buffer.push(False, state_goal, action, self.intrinsic_reward, next_state) #store controller transition
-                MC_buffer.push(True, state, goal, extrinsic_reward, next_state) #store meta-controller transition
+                MC_buffer.push(True, state, i_goal, extrinsic_reward, next_state) #store meta-controller transition
                 # update state
                 state = next_state
                 # manage batch NN update cycle
                 bQn += 1
-                if bQn%batch_size == 0: #update every batch_size
-                    states, next_states, rewards = self.get_random_batch(C_buffer) #pseudo
-                    self.update_Q1(states, next_states, rewards)
-                    states, next_states, rewards = self.get_random_batch(MC_buffer) #pseudo
-                    self.update_Q2(states, next_states, rewards)
+                if bQn % 5000 == 0 and bQn != 0: #update every batch_size=512
+                    #states, next_states, rewards = self.get_random_batch(C_buffer) #pseudo
+                    sample = C_buffer.sample(self.batch_size, False)
+                    self.update_Q1(sample.state, sample.action, sample.next_state, sample.reward)
+                    #states, next_states, rewards = self.get_random_batch(MC_buffer) #pseudo
+                    sample = MC_buffer.sample(self.batch_size, True)
+                    self.update_Q2(sample.state, sample.goal, sample.next_state, sample.reward)
                 # track intrinsic reward success and total
                 if self.intrinsic_reward > 0:
+                    #print("last goal achieved in %s actions!"%(self.num_actions))
+                    self.num_actions = 0
                     self.intrinsic_success_count += 1
+                    #print("self.intrinsic_success_count: ", self.intrinsic_success_count)
+                    self.session_success = True
+                    #utils.show_video()
                 self.intrinsic_total += 1
                 # track extrinsic reward success
                 if extrinsic_reward > 0:
@@ -383,62 +483,142 @@ class Agent():
             # track number of goals tried so far
             self.num_goals_tried += 1
             # when done reset session
-            if self.done:
+            if self.done or self.max_steps == 5000:
                 # track total sessions
                 self.total_sessions += 1
                 # new session
                 self.new_session = True
-            #--update the exploration params--
-            if self.num_goals_tried%self.eval_tries == 0:
-                # how often intrinsic goal reached
-                self.ep1 = 1 - (self.intrinsic_success_count/self.intrinsic_total)
+                print("----done----")
+                #print("self.intrinsic_success_count: ", self.intrinsic_success_count)
+                #print("self.extrinsic_success_count: ", self.extrinsic_success_count)
+                print("self.total_sessions: ", self.total_sessions)
+                #print("Session ending score: ", self.score)
+                if self.total_sessions % 50 == 0:
+                    self.ep1 = self.ep1 - .15
+                    print("New action exploration is %s"%(self.ep1))
+                #self.ep1 = 1 - (self.score/self.max_score)
                 if self.ep1 < .1:
                     self.ep1 = .1 #cap minimum exploration at .1
-                # how often intrinsic goals lead to extrinsic goal
-                #pass
+                #elif self.ep1 > .4:
+                #    self.ep1 = .4 #cap max exploration at .5
+                #print("New action exploration is %s"%(self.ep1))
+                # reset counts
+                self.intrinsic_success_count = 0
+                self.intrinsic_total = .00001
+                self.env.close()
+                #utils.show_video()
+                if self.session_success and self.total_sessions > 300:
+                    print("Success in this video are: ", self.session_success_list)
+                    utils.show_video()
+                print("------------")
+            #--update the exploration params--
+            # if self.intrinsic_success_count%20 == 0:
+            #     # how often intrinsic goal reached
+            #     #print("intrinsic success ratio:  ", self.intrinsic_success_count/self.intrinsic_total)
+            #     #self.ep1 = ((1 - (self.intrinsic_success_count/self.intrinsic_total)) + (1 - (self.extrinsic_success_count/self.total_sessions)))/2 #try tying it to the extrinsic goal so it can just repeat the same thing over and over and decide it's winning
+            #     print("final score after 20 successes: ", self.score)
+            #     self.ep1 = 1 - (self.score/self.max_score)
+            #     if self.ep1 < .1:
+            #         self.ep1 = .1 #cap minimum exploration at .1
+            #     print("New action exploration is %s"%(self.ep1))
+            #     # reset counts
+            #     self.intrinsic_success_count = 0
+            #     self.intrinsic_total = .00001
+            if self.num_goals_tried%self.eval_tries == 0:
+                # # how often intrinsic goal reached
+                # self.ep1 = ((1 - (self.intrinsic_success_count/self.intrinsic_total)) + (.5 * self.ep2))/2 #try tying it to the extrinsic goal so it can just repeat the same thing over and over and decide it's winning
+                # if self.ep1 < .1:
+                #     self.ep1 = .1 #cap minimum exploration at .1
+                # print("New action exploration is %s"%(self.ep1))
+                # # how often intrinsic goals lead to extrinsic goal
+                # #pass
                 # how often extrinsic goal was reached
                 self.ep2 = 1 - (self.extrinsic_success_count/self.total_sessions)
                 if self.ep2 < .1:
                     self.ep2 = .1 #cap minimum exploration at .1
+                print("New goal exploration is %s"%(self.ep2))
+        env.close()
+        utils.show_video()
 
-    def update_Q1(self, states, next_states, rewards):
-        print("inside update_Q1")
+    def update_Q1(self, states, actions, next_states, rewards):
+        #print("inside update_Q1")
+        #states = torch.stack(states, 0).view(512, 1, 84, 336) # works!
+        #print("states: ", states.size())
+        #next_states = torch.stack(next_states, 0).view(512, 1, 84, 336)
+        #print("next_states: ", next_states.size())
+        #rewards = torch.stack(rewards, 0)
+        #rewards = torch.tensor(rewards)
+        #print("rewards: ", rewards.size())
+        preds = []
+        expect = []
         C_pred.zero_grad()
-        prediction = C_pred(states)
-        expectation = C_targ(next_states) #should I consider if the next_state changed the goal? how?
-        #^ changing goal may be a argument to use: pred = random_batch[:-1] and tar = random_batch[1:]
-        #   ^then use just the 'states' and that goal
-        #       ^because the shifted state would = next_state and next_goal
-        expectation = rewards + (gamma * np.amax(expectation)) #pseudo #notice, as long as (gamma^t_prime-t) is relative to the previous state it's gamma^1 = gamma
-        loss = F.nn.MSELoss(prediction, expectation.detatch())
+        for i, _ in enumerate(states):
+            #C_pred.zero_grad()
+            prediction = C_pred(states[i].to(device))
+            prediction = prediction[actions[i]]
+            preds.append(prediction)
+            expectation = C_targ(next_states[i]) #should I consider if the next_state changed the goal? how?
+            expectation = rewards[i] + (self.gamma * torch.max(expectation, dim=0)[0]) #pseudo #notice, as long as (gamma^t_prime-t) is relative to the previous state it's gamma^1 = gamma
+            expect.append(expectation)
+            # loss = F.mse_loss(prediction, expectation.detach())
+            # loss.backward()
+            # optimizerC.step()
+        #prediction = C_pred(states)
+        #prediction = prediction[actions]
+        #expectation = C_targ(next_states) #should I consider if the next_state changed the goal? how?
+        #expectation = rewards + (self.gamma * torch.max(expectation, dim=0)[0]) #pseudo #notice, as long as (gamma^t_prime-t) is relative to the previous state it's gamma^1 = gamma
+        prediction = torch.stack(preds, 0)
+        expectation = torch.stack(expect, 0)
+        loss = F.mse_loss(prediction, expectation.detach())
+        #print("Q1 loss: ", loss)
+        loss.backward()
+        optimizerC.step()
+        #print("end update Q1")
+        #raise NotImplementedError
+
+    def update_Q2(self, states, _goals, next_states, rewards):
+        #print("inside update_Q2")
+        preds = []
+        expect = []
+        C_pred.zero_grad()
+        for i, _ in enumerate(states):
+            #MC_pred.zero_grad()
+            prediction = MC_pred(states[i].to(device))
+            prediction = prediction[_goals[i]]
+            preds.append(prediction)
+            expectation = MC_targ(next_states[i])
+            expectation = rewards[i] + (gamma * torch.max(expectation, dim=0)[0]) #pseudo #notice, as long as (gamma^t_prime-t) is relative to the previous state it's gamma^1 = gamma
+            expect.append(expectation)
+            # loss = F.mse_loss(prediction, expectation.detach())
+            # loss.backward()
+            # optimizerMC.step()
+        prediction = torch.stack(preds, 0)
+        expectation = torch.stack(expect, 0)
+        loss = F.mse_loss(prediction, expectation.detach())
+        #print("Q2 loss: ", loss)
         loss.backward()
         optimizerC.step()
 
-    def update_Q2(self, states, next_states, rewards):
-        print("inside update_Q2")
-        MC_pred.zero_grad()
-        prediction = MC_pred(states)
-        expectation = MC_targ(next_states)
-        expectation = rewards + (gamma * np.amax(expectation)) #pseudo #notice, as long as (gamma^t_prime-t) is relative to the previous state it's gamma^1 = gamma
-        loss = F.nn.MSELoss(prediction, expectation.detatch())
-        loss.backward()
-        optimizerMC.step()
-
     def get_random_batch(self, transitions):
-        print("inside get_random_batch")
-        random_batch = np.array(transitions)[np.random.choice(np.arange(len(transitions)), self.batch_size)] #pseudo, but close?
+        #print("inside get_random_batch")
+        #print("np.array(transitions): ", np.array(transitions))
+        print("len(transitions): ", len(transitions))
+        print("len(np.random.choice(len(transitions),  self.batch_size)): ", len(np.random.choice(len(transitions),  self.batch_size)))
+        for _ in transitions:
+          print(_)
+        random_batch = np.array(transitions)[np.random.choice(len(transitions),  self.batch_size)] #pseudo, but close?
         states = random_batch[:, 'state'] #pseudo
         next_states = random_batch[:, 'next_state'] #pseudo
         rewards = random_batch[:, 'reward'] #pseudo
         return states, next_states, rewards, goals
 
     def update_df(self):
-        pass #may implement if I decide to do gamma^t'- t, where t' = current and t = (future or past) 
+        pass #may implement if I decide to do gamma^t'- t, where t' = current and t = (future or past)       
             
-#--environment--
-env = gym.make('MontezumaRevenge-v4')
+# environment
+#env = gym.make('MontezumaRevenge-v4')
+env = utils.wrap_env(gym.make('MontezumaRevenge-v4'))
 env.reset()
-#env.render()
 
 #---memory---
 # meta-controller
@@ -446,17 +626,25 @@ D2 = namedtuple('D2',
                     ('state', 'goal', 'reward', 'next_state')) #reward = extrinsic reward
 # controller
 D1 = namedtuple('D1',
-                    ('state', 'action', 'goal', 'reward', 'next_state')) #reward = intrinsic reward
+                    ('state', 'action', 'reward', 'next_state')) #reward = intrinsic reward
 
 #---params---
+batch_size = 512
+conv_stack = 'stacked' # 'stacked' or 'side_by_side' but anything other than 'stacker' will trigger 'side_by_side'
 
 # meta-controller dims
-MC_conv_out = 1 * 64 * 7 * 7 #guess for now
+if conv_stack=='stacked':
+    MC_conv_out = 4 * 64 * 7 * 7 # for 4, 1, 84, 84
+else:
+    MC_conv_out = 1 * 64 * 7 * 38 # for 1, 1, 84, 336
 MC_hidden_size = 512
 MC_number_of_goals = 6 #num_of_goals
 
 # controller dims
-C_conv_out = 1 * 64 * 7 * 7 #guess for now
+if conv_stack=='stacked':
+    C_conv_out = 4 * 64 * 7 * 7 # for 4, 1, 84, 84
+else:
+    C_conv_out = 1 * 64 * 7 * 38 # for 1, 1, 84, 336
 C_hidden_size = 512
 C_number_of_actions = env.action_space.n #num_of_actions
 
@@ -468,15 +656,17 @@ C_number_of_actions = env.action_space.n #num_of_actions
 # Agent vars
 env = env
 MC_buffer = ReplayMemory(1000000)
+#MC_buffer = ReplayMemory(50000)
 C_buffer = ReplayMemory(50000)
+#C_buffer = ReplayMemory(10000)
 learning_rate =  0.00025
 gamma = .99
 exploration_param2 = 1 #start at 1 go to 0.1
-exploration_param1 = 1 #start at 1 go to 0.1
+exploration_param1 = 1.15 #start at 1 go to 0.1
 num_of_goals = 6 #randomly picked 6 ftm #object_detector.goals.n #pseudo
 num_of_actions = env.action_space.n
 max_goals_to_try = 10000
-batch_size = 512
+#batch_size = 512
 extrinsic_tries_before_eval = batch_size #setting for batch_size ftm
 
 # Number of GPUs available. Use 0 for CPU mode.
